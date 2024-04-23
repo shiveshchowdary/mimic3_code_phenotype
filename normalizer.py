@@ -1,6 +1,6 @@
 import torch
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -11,10 +11,11 @@ from tqdm import tqdm
 import pickle
 pd.set_option('future.no_silent_downcasting',True)
 
+            
+
 class Normalizer:
-    def __init__(self, data, data_dir):
-        self.data = data
-        self.data_dir = data_dir
+    def __init__(self, data_dir_list):
+        self.data_list = data_dir_list
         self.categorical_variables = ['Glascow coma scale eye opening', 
                                  'Glascow coma scale motor response', 
                                  'Glascow coma scale verbal response']
@@ -22,45 +23,39 @@ class Normalizer:
         
         
     def get_mean_var(self):
-        sample_path = self.data_dir + self.data['stay'][0]
-        id_name_dict = {}
-        df = pd.read_csv(sample_path)
-        df.drop(labels=self.categorical_variables, axis=1, inplace=True)
-        for i in range(len(df.columns)):
-            id_name_dict[i] = df.columns[i]
-        variable_values = {k : [] for k in df.columns[1:]}
-        for sample_path in tqdm(self.data['stay']):
-            sample_path = self.data_dir+sample_path
+        var_dict = {}
+        for sample_path in tqdm(self.data_list):
             df = pd.read_csv(sample_path)
+            df.replace(['ERROR','no data','.','-','/','VERIFIED','CLOTTED',"*",'ERROR DISREGARD PREVIOUS RESULT OF 32','DISREGARD PREVIOUSLY REPORTED 33','DISREGARD',"+"], np.nan, inplace=True)
+            df.dropna(inplace = True)
             values = df.values
-            df.drop(labels=self.categorical_variables, axis=1, inplace=True)
-            df.replace(['ERROR','no data','.','-','/','VERIFIED','CLOTTED',"*",'ERROR DISREGARD PREVIOUS RESULT OF 32','DISREGARD PREVIOUSLY REPORTED 33'], np.nan, inplace=True)
-            cols = df.columns[1:]
-            df = df[cols]
-            values = df.values
-            for i in range(values.shape[0]):
-                for j in range(values.shape[1]):
-                    if self.isNAN(values[i][j]) == False:
-                        variable_values[id_name_dict[j+1]].append(float(values[i][j]))
+            for variable, value in zip(values[:,1], values[:,2]):
+                if variable not in var_dict:
+                    var_dict[variable] = []
+                    var_dict[variable].append(float(value))
+                else:
+                    var_dict[variable].append(float(value))
+        
         result_dict = {}
-        for feature, values in variable_values.items():
+        for feature, values in var_dict.items():
             mean_value = np.mean(values)
             variance_value = np.var(values)
             result_dict[feature] = {'mean': mean_value, 'variance': variance_value}
         return result_dict
-    def isNAN(self, val):
-        return val!=val
-    
-
-train_data_path = "/data/datasets/mimic3_18var/root/phenotyping/train_listfile.csv"
-val_data_path = "/data/datasets/mimic3_18var/root/phenotyping/val_listfile.csv"
-
-data_dir = "/data/datasets/mimic3_18var/root/phenotyping/train/"
-
 
 save = False
 if save:
-    normalizer = Normalizer(pd.read_csv(train_data_path), data_dir)
+    dir_list = os.listdir("/data/datasets/mimic3_18var/modified_data/data_18_var/root/train")
+
+    episodes_list = []
+    for d in tqdm(dir_list):
+        d = "/data/datasets/mimic3_18var/modified_data/data_18_var/root/train/" + d
+        dirs = os.listdir(d)
+        for ep in dirs:
+            if "_timeseries" in ep:
+                episodes_list.append(d + "/" + ep)
+            
+    normalizer = Normalizer(episodes_list)
     with open('normalizer.pkl', 'wb') as file:
         pickle.dump(normalizer, file)
 
