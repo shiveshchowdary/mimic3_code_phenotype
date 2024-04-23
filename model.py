@@ -7,37 +7,53 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.nn import functional as F
+import math
 
+def t2v(tau, f, out_features, w, b, w0, b0, arg=None):
+    if arg:
+        v1 = f(torch.matmul(tau, w) + b, arg)
+    else:
+        v1 = f(torch.matmul(tau, w) + b)
+    v2 = torch.matmul(tau, w0) + b0
+    return torch.cat([v1, v2], -1)
 
+class SineActivation(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(SineActivation, self).__init__()
+        self.out_features = out_features
+        self.w0 = nn.parameter.Parameter(torch.randn(in_features, 1))
+        self.b0 = nn.parameter.Parameter(torch.randn(1))
+        self.w = nn.parameter.Parameter(torch.randn(in_features, out_features-1))
+        self.b = nn.parameter.Parameter(torch.randn(out_features-1))
+        self.f = torch.sin
 
+    def forward(self, tau):
+        return t2v(tau.unsqueeze(-1), self.f, self.out_features, self.w, self.b, self.w0, self.b0)
 
-class TimeSinusoidalEmbedding(nn.Module):
-    def __init__(self, embedding_dim):
-        super(TimeSinusoidalEmbedding, self).__init__()
-        self.embedding_dim = embedding_dim
+class CosineActivation(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(CosineActivation, self).__init__()
+        self.out_features = out_features
+        self.w0 = nn.parameter.Parameter(torch.randn(in_features, 1))
+        self.b0 = nn.parameter.Parameter(torch.randn(1))
+        self.w = nn.parameter.Parameter(torch.randn(in_features, out_features-1))
+        self.b = nn.parameter.Parameter(torch.randn(out_features-1))
+        self.f = torch.cos
 
-    def forward(self, input_hours):
-        position = torch.arange(0, self.embedding_dim, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-        div_term = torch.exp(torch.arange(0, self.embedding_dim, 2, dtype=torch.float32) * -(np.log(10000.0) / self.embedding_dim))
-        div_term = div_term.to(DEVICE)
-        
-        sin_terms = torch.sin(input_hours.unsqueeze(-1) * div_term).to(DEVICE)
-        cos_terms = torch.cos(input_hours.unsqueeze(-1) * div_term).to(DEVICE)
+    def forward(self, tau):
+        return t2v(tau.unsqueeze(-1), self.f, self.out_features, self.w, self.b, self.w0, self.b0)
 
-
-        sinusoidal_embedding = torch.empty(input_hours.size(0),input_hours.size(1),self.embedding_dim, dtype=torch.float32)
-        sinusoidal_embedding[:, :, 0::2] = sin_terms
-        sinusoidal_embedding[:, :, 1::2] = cos_terms
-        return sinusoidal_embedding.to(DEVICE)
 
 class ContinuousValueEmbedding(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        self.embedding = nn.Linear(1, d_model)
+        self.W = nn.Linear(1, d_model*2)
+        self.U = nn.Linear(d_model*2, d_model)
         self.tanh = nn.Tanh()
     def forward(self, x):
-        out = self.embedding(x.unsqueeze(2))
+        out = self.W(x.unsqueeze(2))
         out = self.tanh(out)
+        out = self.U(out)
         return out
 
 
@@ -52,19 +68,46 @@ class VariableEmbedding(nn.Module):
     
 
 class Embedding(nn.Module):
-    def __init__(self, d_model, num_variables, sinusoidal):
+    def __init__(self, d_model, num_variables, sinusoidal, pre_training = False):
         super().__init__()
+        self.sinusoidal = sinusoidal
         self.cvs_value = ContinuousValueEmbedding(d_model)
         if sinusoidal:
-            self.cvs_time = TimeSinusoidalEmbedding(d_model)
+            self.cvs_time = SineActivation(1, d_model)
+        if sinusoidal == "both":
+            self.cvs_time = ContinuousValueEmbedding(d_model)
+            self.sin_time = SineActivation(1, d_model)
         else:
             self.cvs_time = ContinuousValueEmbedding(d_model)
         self.var_embed = VariableEmbedding(d_model, num_variables)
-    def forward(self, encoder_input):
+        self.d_model = d_model
+        if pre_training==True:
+            self.mask_embedding = nn.Embedding(1, d_model).to(DEVICE)
+    def forward(self, encoder_input, pre_training_mask = None):
         time = encoder_input[0]
         variable = encoder_input[1]
         value = encoder_input[2]
-        embed = self.cvs_time(time) + self.cvs_value(value) + self.var_embed(variable)
+        if self.sinusoidal == "both":
+            time_embed = self.cvs_time(time) + self.sin_time(time)
+        else:
+            time_embed = self.cvs_time(time)
+        if pre_training_mask is not None:
+            #pretraining_mask = (Batch_size, MAX_LEN)
+            #value = (Batch_size, MAX_LEN)
+            pre_training_mask = pre_training_mask.unsqueeze(-1).expand(-1, -1, self.d_model)
+            #pretraining_mask = (Batch_size, MAX_LEN, d_model)
+            mask_token = torch.tensor([[0]], dtype=torch.int64).to(DEVICE)
+            mask_embed = self.mask_embedding(mask_token).to(DEVICE)
+            #mask_embed = (1, d_model)
+            mask_embed = mask_embed.expand(value.size(0), value.size(1), -1).to(DEVICE)
+            #mask_embed = (Batch_size, MAX_LEN, d_model)
+            value_embed = self.cvs_value(value)
+            #value_embed = (Batch_size, MAX_LEN, d_model)
+            embeds = torch.where(pre_training_mask==0, value_embed, mask_embed).to(DEVICE)
+        else:
+            embeds = self.cvs_value(value)
+        embed = time_embed + embeds + self.var_embed(variable)
+         
         return embed
 
 class Attention(nn.Module):
@@ -127,52 +170,108 @@ class EncoderBlock(nn.Module):
         return out
 
 class Encoder(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, num_variables , N, sinusoidal):
+    def __init__(self, d_model, n_heads, d_ff, num_variables , N, sinusoidal, pre_training = False):
         super().__init__()
-        self.embedding = Embedding(d_model, num_variables, sinusoidal)
+        self.embedding = Embedding(d_model, num_variables, sinusoidal, pre_training)
         self.encoder_blocks = nn.ModuleList([EncoderBlock(d_model, n_heads, d_ff) for _ in range(N)])
         self.N = N
     
-    def forward(self, encoder_input, mask):
+    def forward(self, encoder_input, mask, pretrain_mask=None):
         time = encoder_input[0]
         variable = encoder_input[1]
         value = encoder_input[2]
-        x = self.embedding((time, variable, value))
+        x = self.embedding((time, variable, value), pretrain_mask)
         for block in self.encoder_blocks:
             x = block(x, mask)
         return x
 
+# class FusionSelfAttention(nn.Module):
+#     def __init__(self, d_model, dropout = 0.2):
+#         super().__init__()
+#         self.Wa = nn.Linear(d_model, d_model)
+#         self.Ua = nn.Linear(d_model, d_model)
+#         self.Va = nn.Linear(d_model, 1)
+#         self.dropout = nn.Dropout(0.2)
+        
+#     def forward(self, out, mask):
+#         q = out.unsqueeze(2) 
+#         k = out.unsqueeze(1) 
+#         v = out 
+#         a = F.tanh(self.Wa(q) + self.Ua(k)) 
+#         wei = self.Va(self.dropout(a)).squeeze()
+#         wei = wei.masked_fill(mask == 0, float('-inf'))
+#         wei = F.softmax(wei, dim = -1)
+#         wei = self.dropout(wei)
+#         out = wei@v
+#         return out
+
+    
 class FusionSelfAttention(nn.Module):
-    def __init__(self, d_model, dropout = 0.2):
-        super().__init__()
-        self.Wa = nn.Linear(d_model, d_model)
-        self.Ua = nn.Linear(d_model, d_model)
-        self.Va = nn.Linear(d_model, 1)
-        self.dropout = nn.Dropout(0.2)
+    def __init__(self, input_size, da = 64):
+        super(FusionSelfAttention, self).__init__()
+        self.input_size = input_size
+        self.output_size = 1
+    
+        self.Wa = nn.Linear(input_size, da)
+        self.u = nn.Linear(da, 1, bias=False)
         
-    def forward(self, out, mask):
-        q = out.unsqueeze(2) 
-        k = out.unsqueeze(1) 
-        v = out 
-        a = F.tanh(self.Wa(q) + self.Ua(k)) 
-        wei = self.Va(self.dropout(a)).squeeze()
-        wei = wei.masked_fill(mask == 0, float('-inf'))
-        wei = F.softmax(wei, dim = -1)
-        wei = self.dropout(wei)
-        out = wei@v
-        return out
+    def forward(self, c, mask=None):
         
-class Model(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, num_variables, N, sinusoidal = False):
+        intermediate = torch.tanh(self.Wa(c))
+        scores = self.u(intermediate)
+        # print(scores.shape)
+        if mask is not None:
+            scores = scores.squeeze(-1).masked_fill(mask.squeeze(1) == 0, float('-inf'))
+        # print("scores", scores.shape)
+        attention_weights = F.softmax(scores, dim=-1)
+        return attention_weights
+
+
+class StratsModel(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, num_variables, N, sinusoidal = False, pre_training=False):
         super().__init__()
-        self.encoder = Encoder(d_model, n_heads, d_ff, num_variables, N, sinusoidal)
+        self.encoder = Encoder(d_model, n_heads, d_ff, num_variables, N, sinusoidal, pre_training)
+        # self.fsa = FusionSelfAttention(d_model)
+    
+    def forward(self, x, mask, pre_training_mask=None):
+        out = self.encoder(x, mask, pre_training_mask)
+        # weights = self.fsa(out, mask)
+        # out = out.masked_fill(mask.transpose(-2,-1)==0, 0)
+        # out = out.sum(dim = 1)
+        #out = self.proj(out)
+        return out#.squeeze(-1)
+
+class ForecastModel(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.fc = nn.Linear(d_model, 1)
+    
+    def forward(self, x, mask = None):
+        return self.fc(x).squeeze(-1)
+
+class PredictionModel(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
         self.fsa = FusionSelfAttention(d_model)
         self.proj = nn.Linear(d_model, 25)
-    
     def forward(self, x, mask):
-        out = self.encoder(x, mask)
-        out = self.fsa(out, mask)
-        out = out.masked_fill(mask.transpose(-2,-1)==0, 0)
-        out = out.sum(dim = 1)
+        weights = self.fsa(x, mask)
+        # print(x.shape)
+        # print(weights.shape)
+        # print(mask.shape)
+        out = torch.sum(weights.unsqueeze(-1) * x, dim=1)
+        # out = x.masked_fill(mask.transpose(-2, -1) == 0, 0)
+        # out = out.sum(dim=1)
         out = self.proj(out)
+        return out
+    
+
+class Model(nn.Module):
+    def __init__(self, strats_model, out_model):
+        super().__init__()
+        self.strats_model = strats_model
+        self.out_model = out_model
+    def forward(self, x, mask, pre_training_mask = None):
+        out = self.strats_model(x, mask, pre_training_mask)
+        out = self.out_model(out, mask)
         return out
